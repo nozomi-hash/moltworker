@@ -2,7 +2,7 @@
 # .dev.vars is gitignored and used by wrangler dev
 
 # AI Provider (at least one required)
-ANTHROPIC_API_KEY=sk-ant-...
+# ANTHROPIC_API_KEY=sk-ant-...
 # OPENAI_API_KEY=sk-...
 
 # Cloudflare AI Gateway (alternative to direct provider keys)
@@ -16,7 +16,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 # AI_GATEWAY_BASE_URL=https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/anthropic
 
 # Local development mode - skips Cloudflare Access auth and bypasses device pairing
-# DEV_MODE=true
+DEV_MODE=true
 
 # E2E test mode - skips Cloudflare Access auth but keeps device pairing enabled
 # Use this for automated tests that need to test the real pairing flow
@@ -26,7 +26,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 # DEBUG_ROUTES=true
 
 # Optional - set a fixed token instead of auto-generated
-MOLTBOT_GATEWAY_TOKEN=dev-token-change-in-prod
+# MOLTBOT_GATEWAY_TOKEN=dev-token-change-in-prod
 
 # Cloudflare Access configuration for /_admin and /api routes
 # Required for admin UI and device pairing API in production
@@ -40,3 +40,6 @@ MOLTBOT_GATEWAY_TOKEN=dev-token-change-in-prod
 # CDP (Chrome DevTools Protocol) configuration for browser automation
 # CDP_SECRET=shared-secret-for-cdp-auth
 # WORKER_URL=https://your-worker.example.com
+
+GEMINI_API_KEY=AIzaSyC2TYYFUfagspqJdBIPLDEfFXxTBTOmMZk
+

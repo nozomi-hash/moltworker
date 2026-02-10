@@ -401,4 +401,35 @@ debug.get('/container-config', async (c) => {
   }
 });
 
+// GET /debug/internal-logs - Returns raw stdout/stderr from the gateway process
+debug.get('/internal-logs', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    const process = await findExistingMoltbotProcess(sandbox);
+    if (!process) {
+      return c.text('No Moltbot process running', 404);
+    }
+    const logs = await process.getLogs();
+    console.log('--- CONTAINER STDOUT ---');
+    console.log(logs.stdout || '(empty)');
+    console.log('--- CONTAINER STDERR ---');
+    console.log(logs.stderr || '(empty)');
+    return c.text(`--- STDOUT ---\n${logs.stdout || '(empty)'}\n\n--- STDERR ---\n${logs.stderr || '(empty)'}`);
+  } catch (error) {
+    return c.text(`Error getting logs: ${error}`, 500);
+  }
+});
+
+debug.get('/logs-text', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    const process = await findExistingMoltbotProcess(sandbox);
+    if (!process) return c.text('No process');
+    const logs = await process.getLogs();
+    return c.text(`STDOUT:\n${logs.stdout}\n\nSTDERR:\n${logs.stderr}`);
+  } catch (e) {
+    return c.text(`Error: ${e}`);
+  }
+});
+
 export { debug };

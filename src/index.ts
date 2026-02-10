@@ -1,5 +1,6 @@
 /**
  * Moltbot + Cloudflare Sandbox
+ * // MCP test
  *
  * This Worker runs Moltbot personal AI assistant in a Cloudflare Sandbox container.
  * It proxies all requests to the Moltbot Gateway's web UI and WebSocket endpoint.
@@ -118,109 +119,96 @@ function buildSandboxOptions(env: MoltbotEnv): SandboxOptions {
 const app = new Hono<AppEnv>();
 
 // =============================================================================
-// MIDDLEWARE: Applied to ALL routes
+// ROUTING & MIDDLEWARE
 // =============================================================================
 
-// Middleware: Log every request
-app.use('*', async (c, next) => {
-  const url = new URL(c.req.url);
-  const redactedSearch = redactSensitiveParams(url);
-  console.log(`[REQ] ${c.req.method} ${url.pathname}${redactedSearch}`);
-  console.log(`[REQ] Has ANTHROPIC_API_KEY: ${!!c.env.ANTHROPIC_API_KEY}`);
-  console.log(`[REQ] DEV_MODE: ${c.env.DEV_MODE}`);
-  console.log(`[REQ] DEBUG_ROUTES: ${c.env.DEBUG_ROUTES}`);
-  await next();
-});
-
-// Middleware: Initialize sandbox for all requests
-app.use('*', async (c, next) => {
+// 1. TRULY PUBLIC ROUTE: Diagnostics bypass (highest priority)
+app.get('/public-debug-json', async (c) => {
   const options = buildSandboxOptions(c.env);
   const sandbox = getSandbox(c.env.Sandbox, 'moltbot', options);
-  c.set('sandbox', sandbox);
+  try {
+    const processes = await sandbox.listProcesses();
+    let gatewayProc = null;
+    for (const p of processes) {
+      if (p.command.toLowerCase().includes('openclaw') && p.status === 'running') {
+        gatewayProc = p;
+        break;
+      }
+    }
+    const logs = gatewayProc ? await gatewayProc.getLogs() : { stdout: 'N/A', stderr: 'N/A' };
+    return c.json({
+      status: gatewayProc ? 'running' : 'not_found',
+      processes: processes.map(p => ({ id: p.id, command: p.command, status: p.status })),
+      logs: { stdout: logs.stdout, stderr: logs.stderr },
+      env: { has_key: !!c.env.CLOUDFLARE_AI_GATEWAY_API_KEY, model: c.env.CF_AI_GATEWAY_MODEL }
+    });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+// 2. LOGGING & DEBUG MIDDLEWARE
+app.use('*', async (c, next) => {
+  const url = new URL(c.req.url);
+  console.log(`[REQ] ${c.req.method} ${url.pathname}`);
+
+  await next();
+
+  // Add a source header to track if the Worker actually handled this
+  c.header('X-Moltworker-Source', 'worker');
+  c.header('X-Moltworker-Path', url.pathname);
+});
+
+// 3. SANDBOX INITIALIZATION (Needed by both public and private routes)
+app.use('*', async (c, next) => {
+  const options = buildSandboxOptions(c.env);
+  c.set('sandbox', getSandbox(c.env.Sandbox, 'moltbot', options));
   await next();
 });
 
-// =============================================================================
-// PUBLIC ROUTES: No Cloudflare Access authentication required
-// =============================================================================
-
-// Mount public routes first (before auth middleware)
-// Includes: /sandbox-health, /logo.png, /logo-small.png, /api/status, /_admin/assets/*
+// 4. PUBLIC ROUTES MOUNTING (Bypass auth)
 app.route('/', publicRoutes);
-
-// Mount CDP routes (uses shared secret auth via query param, not CF Access)
 app.route('/cdp', cdp);
 
-// =============================================================================
-// PROTECTED ROUTES: Cloudflare Access authentication required
-// =============================================================================
-
-// Middleware: Validate required environment variables (skip in dev mode and for debug routes)
+// 5. CLOUDFLARE ACCESS (Protected routes only)
 app.use('*', async (c, next) => {
-  const url = new URL(c.req.url);
+  const path = new URL(c.req.url).pathname;
 
-  // Skip validation for debug routes (they have their own enable check)
-  if (url.pathname.startsWith('/debug')) {
+  // DEFINITIVE PUBLIC BYPASS (Must match routes exactly as they are mounted)
+  const isPublic =
+    path === '/api/status' ||
+    path === '/sandbox-health' ||
+    path === '/logo.png' ||
+    path === '/logo-small.png' ||
+    path.startsWith('/_admin/assets/') ||
+    path.startsWith('/api/public/') ||
+    path.startsWith('/cdp') ||
+    path === '/public-debug-json';
+
+  if (isPublic) {
     return next();
   }
 
-  // Skip validation in dev mode
-  if (c.env.DEV_MODE === 'true') {
-    return next();
-  }
-
-  const missingVars = validateRequiredEnv(c.env);
-  if (missingVars.length > 0) {
-    console.error('[CONFIG] Missing required environment variables:', missingVars.join(', '));
-
-    const acceptsHtml = c.req.header('Accept')?.includes('text/html');
-    if (acceptsHtml) {
-      // Return a user-friendly HTML error page
-      const html = configErrorHtml.replace('{{MISSING_VARS}}', missingVars.join(', '));
-      return c.html(html, 503);
-    }
-
-    // Return JSON error for API requests
-    return c.json(
-      {
-        error: 'Configuration error',
-        message: 'Required environment variables are not configured',
-        missing: missingVars,
-        hint: 'Set these using: wrangler secret put <VARIABLE_NAME>',
-      },
-      503,
-    );
-  }
-
-  return next();
-});
-
-// Middleware: Cloudflare Access authentication for protected routes
-app.use('*', async (c, next) => {
-  // Determine response type based on Accept header
+  const isApi = path.startsWith('/api/');
   const acceptsHtml = c.req.header('Accept')?.includes('text/html');
+
+  // CRITICAL: For /api/admin/* we ALWAYS use 'json' mode and NEVER redirect.
+  // This ensures the SPA gets a 401 instead of a 302 login page.
+  const isAdminApi = path.startsWith('/api/admin/');
+
   const middleware = createAccessMiddleware({
-    type: acceptsHtml ? 'html' : 'json',
-    redirectOnMissing: acceptsHtml,
+    type: isAdminApi || isApi || !acceptsHtml ? 'json' : 'html',
+    redirectOnMissing: !isAdminApi && !isApi && acceptsHtml,
   });
 
   return middleware(c, next);
 });
 
-// Mount API routes (protected by Cloudflare Access)
+// 6. PROTECTED ROUTES MOUNTING
 app.route('/api', api);
-
-// Mount Admin UI routes (protected by Cloudflare Access)
+app.get('/admin', (c) => c.redirect('/_admin/', 301));
+app.get('/_admin', (c) => c.redirect('/_admin/', 301));
 app.route('/_admin', adminUi);
-
-// Mount debug routes (protected by Cloudflare Access, only when DEBUG_ROUTES is enabled)
-app.use('/debug/*', async (c, next) => {
-  if (c.env.DEBUG_ROUTES !== 'true') {
-    return c.json({ error: 'Debug routes are disabled' }, 404);
-  }
-  return next();
-});
-app.route('/debug', debug);
 
 // =============================================================================
 // CATCH-ALL: Proxy to Moltbot gateway
@@ -257,14 +245,15 @@ app.all('*', async (c) => {
 
   // Ensure moltbot is running (this will wait for startup)
   try {
+    console.log(`[PROXY] Ensuring gateway for ${url.pathname}...`);
     await ensureMoltbotGateway(sandbox, c.env);
   } catch (error) {
-    console.error('[PROXY] Failed to start Moltbot:', error);
+    console.error('[PROXY] CRITICAL: Failed to start Moltbot:', error);
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
     let hint = 'Check worker logs with: wrangler tail';
-    if (!c.env.ANTHROPIC_API_KEY) {
-      hint = 'ANTHROPIC_API_KEY is not set. Run: wrangler secret put ANTHROPIC_API_KEY';
+    if (!c.env.ANTHROPIC_API_KEY && !c.env.CLOUDFLARE_AI_GATEWAY_API_KEY) {
+      hint = 'AI provider not configured. Set ANTHROPIC_API_KEY or CLOUDFLARE_AI_GATEWAY_API_KEY.';
     } else if (errorMessage.includes('heap out of memory') || errorMessage.includes('OOM')) {
       hint = 'Gateway ran out of memory. Try again or check for memory leaks.';
     }
@@ -289,14 +278,14 @@ app.all('*', async (c) => {
       console.log('[WS] URL:', url.pathname + redactedSearch);
     }
 
-    // Inject gateway token into WebSocket request if not already present.
-    // CF Access redirects strip query params, so authenticated users lose ?token=.
-    // Since the user already passed CF Access auth, we inject the token server-side.
+    // Inject gateway token into WebSocket request.
+    // We ALWAYS use the secret value to ensure synchronization, even if the URL has a stale param.
     let wsRequest = request;
-    if (c.env.MOLTBOT_GATEWAY_TOKEN && !url.searchParams.has('token')) {
+    if (c.env.MOLTBOT_GATEWAY_TOKEN) {
       const tokenUrl = new URL(url.toString());
       tokenUrl.searchParams.set('token', c.env.MOLTBOT_GATEWAY_TOKEN);
       wsRequest = new Request(tokenUrl.toString(), request);
+      console.log('[WS] Injected secret token for path:', url.pathname);
     }
 
     // Get WebSocket connection to the container
@@ -449,26 +438,24 @@ app.all('*', async (c) => {
  * Syncs moltbot config/state from container to R2 for persistence.
  */
 async function scheduled(
-  _event: ScheduledEvent,
+  _controller: ScheduledController,
   env: MoltbotEnv,
-  _ctx: ExecutionContext,
+  _ctx: ExecutionContext
 ): Promise<void> {
-  const options = buildSandboxOptions(env);
-  const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
+  try {
+    const options = buildSandboxOptions(env);
+    const sandbox = getSandbox(env.Sandbox, 'moltbot', options);
 
-  const gatewayProcess = await findExistingMoltbotProcess(sandbox);
-  if (!gatewayProcess) {
-    console.log('[cron] Gateway not running yet, skipping sync');
-    return;
-  }
+    const gatewayProcess = await findExistingMoltbotProcess(sandbox);
+    if (!gatewayProcess) {
+      console.log('[cron] Gateway not running yet, skipping sync');
+      return;
+    }
 
-  console.log('[cron] Starting backup sync to R2...');
-  const result = await syncToR2(sandbox, env);
-
-  if (result.success) {
-    console.log('[cron] Backup sync completed successfully at', result.lastSync);
-  } else {
-    console.error('[cron] Backup sync failed:', result.error, result.details || '');
+    console.log('[cron] Running periodic R2 sync...');
+    await syncToR2(sandbox, env);
+  } catch (err) {
+    console.error('[cron] Error in scheduled sync:', err);
   }
 }
 

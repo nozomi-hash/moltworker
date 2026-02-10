@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 # Startup script for OpenClaw in Cloudflare Sandbox
 # This script:
 # 1. Restores config from R2 backup if available
@@ -6,11 +6,25 @@
 # 3. Patches config for features onboard doesn't cover (channels, gateway auth)
 # 4. Starts the gateway
 
+# UNCONDITIONAL MARKER: Write to /tmp to confirm script is actually running
+echo "SCRIPT_START=$(date)" > /tmp/startup.marker
+echo "Starting OpenClaw startup script..."
+
 set -e
 
-if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
-    echo "OpenClaw gateway is already running, exiting."
-    exit 0
+# Skip redundant check to allow forceRestart logic to work properly
+# if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
+#     echo "OpenClaw gateway is already running, exiting."
+#     exit 0
+# fi
+
+# Enable persistent logging to R2 mount
+STARTUP_LOG="/data/moltbot/startup.log"
+if [ -d "/data/moltbot" ]; then
+    touch "$STARTUP_LOG"
+    # Capture everything to R2 so we can debug even after container reuse/exit
+    exec > >(tee -a "$STARTUP_LOG") 2> >(tee -a "$STARTUP_LOG" >&2)
+    echo "--- Startup Log Started: $(date) ---"
 fi
 
 CONFIG_DIR="/root/.openclaw"
@@ -67,7 +81,7 @@ if [ -f "$BACKUP_DIR/openclaw/openclaw.json" ]; then
         echo "Restored config from R2 backup"
     fi
 elif [ -f "$BACKUP_DIR/clawdbot/clawdbot.json" ]; then
-    # Legacy backup format — migrate .clawdbot data into .openclaw
+    # Legacy backup format 窶・migrate .clawdbot data into .openclaw
     if should_restore_from_r2; then
         echo "Restoring from legacy R2 backup at $BACKUP_DIR/clawdbot..."
         cp -a "$BACKUP_DIR/clawdbot/." "$CONFIG_DIR/"
@@ -136,6 +150,12 @@ if [ ! -f "$CONFIG_FILE" ]; then
         AUTH_ARGS="--auth-choice openai-api-key --openai-api-key $OPENAI_API_KEY"
     fi
 
+    echo "DEBUG: Line encoding check (cat -v):"
+    head -n 1 /usr/local/bin/start-openclaw.sh | cat -v
+    echo "DEBUG: Binary check:"
+    ls -l /usr/local/bin/openclaw || echo "openclaw binary NOT FOUND"
+    echo "DEBUG: Env check: ACCOUNT_ID=$CF_AI_GATEWAY_ACCOUNT_ID"
+
     openclaw onboard --non-interactive --accept-risk \
         --mode local \
         $AUTH_ARGS \
@@ -143,7 +163,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
         --gateway-bind lan \
         --skip-channels \
         --skip-skills \
-        --skip-health
+        --skip-health || { echo "CRITICAL: onboard failed with code $?"; exit 1; }
 
     echo "Onboard completed"
 else
@@ -203,8 +223,11 @@ if (process.env.OPENCLAW_DEV_MODE === 'true') {
 if (process.env.CF_AI_GATEWAY_MODEL) {
     const raw = process.env.CF_AI_GATEWAY_MODEL;
     const slashIdx = raw.indexOf('/');
-    const gwProvider = raw.substring(0, slashIdx);
+    let gwProvider = raw.substring(0, slashIdx);
     const modelId = raw.substring(slashIdx + 1);
+
+    // Map short names to AI Gateway provider names
+    if (gwProvider === 'google') gwProvider = 'google-generative-ai';
 
     const accountId = process.env.CF_AI_GATEWAY_ACCOUNT_ID;
     const gatewayId = process.env.CF_AI_GATEWAY_GATEWAY_ID;
@@ -213,13 +236,33 @@ if (process.env.CF_AI_GATEWAY_MODEL) {
     let baseUrl;
     if (accountId && gatewayId) {
         baseUrl = 'https://gateway.ai.cloudflare.com/v1/' + accountId + '/' + gatewayId + '/' + gwProvider;
-        if (gwProvider === 'workers-ai') baseUrl += '/v1';
+        if (gwProvider === 'workers-ai') {
+            baseUrl += '/v1';
+        } else if (gwProvider === 'google-generative-ai') {
+            // Native Google AI Gateway endpoint
+            // OpenClaw's Google adapter will append /v1beta/...
+            baseUrl += ''; 
+        }
     } else if (gwProvider === 'workers-ai' && process.env.CF_ACCOUNT_ID) {
         baseUrl = 'https://api.cloudflare.com/client/v4/accounts/' + process.env.CF_ACCOUNT_ID + '/ai/v1';
     }
 
     if (baseUrl && apiKey) {
-        const api = gwProvider === 'anthropic' ? 'anthropic-messages' : 'openai-completions';
+        let api = 'openai-completions';
+        let adaptiveModelId = modelId;
+
+        if (gwProvider === 'anthropic') {
+            api = 'anthropic-messages';
+        } else if (gwProvider === 'google-generative-ai') {
+            api = 'google-generative-ai';
+            // Per the teacher's guide (Case Study 0.5), we MUST use the google/ prefix
+            // for Gemini via Cloudflare AI Gateway.
+            if (!modelId.startsWith('google/')) {
+                adaptiveModelId = 'google/' + modelId;
+            } else {
+                adaptiveModelId = modelId;
+            }
+        }
         const providerName = 'cf-ai-gw-' + gwProvider;
 
         config.models = config.models || {};
@@ -228,12 +271,21 @@ if (process.env.CF_AI_GATEWAY_MODEL) {
             baseUrl: baseUrl,
             apiKey: apiKey,
             api: api,
-            models: [{ id: modelId, name: modelId, contextWindow: 131072, maxTokens: 8192 }],
+            models: [{ id: adaptiveModelId, name: adaptiveModelId, contextWindow: 131072, maxTokens: 8192 }],
         };
         config.agents = config.agents || {};
         config.agents.defaults = config.agents.defaults || {};
-        config.agents.defaults.model = { primary: providerName + '/' + modelId };
-        console.log('AI Gateway model override: provider=' + providerName + ' model=' + modelId + ' via ' + baseUrl);
+        config.agents.defaults.model = { primary: providerName + '/' + adaptiveModelId };
+        
+        console.log('AI Gateway model override: provider=' + providerName + ' model=' + adaptiveModelId + ' via ' + baseUrl);
+        
+        // Diagnostic: Dump redacted config
+        const debugConfig = JSON.parse(JSON.stringify(config.models.providers[providerName]));
+        debugConfig.apiKey = 'REDACTED';
+        console.log('Final provider config (redacted):', JSON.stringify(debugConfig, null, 2));
+
+        // Save to a public-accessible place for the Worker to read if needed
+        fs.writeFileSync('/tmp/openclaw-config-dump.json', JSON.stringify(debugConfig));
     } else {
         console.warn('CF_AI_GATEWAY_MODEL set but missing required config (account ID, gateway ID, or API key)');
     }

@@ -307,6 +307,74 @@ adminApi.post('/gateway/restart', async (c) => {
   }
 });
 
+/**
+ * POST /api/admin/test-ai
+ * Direct test of the AI Gateway mapping to verify Gemini is responding.
+ */
+adminApi.post('/test-ai', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    // Ensure moltbot is running
+    await ensureMoltbotGateway(sandbox, c.env);
+
+    const token = c.env.MOLTBOT_GATEWAY_TOKEN;
+    const tokenArg = token ? ` --token ${token}` : '';
+
+    // Run a simple completion via CLI
+    // Note: This relies on the openclaw binary being correctly configured
+    const proc = await sandbox.startProcess(
+      `openclaw chat --json "Hi" --url ws://localhost:18789${tokenArg}`
+    );
+    await waitForProcess(proc, 15000);
+
+    const logs = await proc.getLogs();
+    const stdout = logs.stdout || '';
+    const stderr = logs.stderr || '';
+
+    return c.json({
+      success: proc.exitCode === 0,
+      stdout,
+      stderr,
+      exitCode: proc.exitCode
+    });
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+
+/**
+ * GET /api/admin/diagnostics
+ * Authenticated diagnostics route to inspect sandbox state and logs.
+ * Accessible via the browser/Admin UI after Cloudflare Access login.
+ */
+adminApi.get('/diagnostics', async (c) => {
+  const sandbox = c.get('sandbox');
+  try {
+    const processes = await sandbox.listProcesses();
+    let gatewayProc = null;
+    for (const p of processes) {
+      const cmd = p.command.toLowerCase();
+      if (cmd.includes('start-openclaw.sh') || cmd.includes('openclaw gateway')) {
+        if (p.status === 'running' || p.status === 'starting') {
+          gatewayProc = p;
+          break;
+        }
+      }
+    }
+    const logs = gatewayProc ? await gatewayProc.getLogs() : { stdout: 'N/A', stderr: 'N/A' };
+    return c.json({
+      status: gatewayProc ? 'running' : 'not_found',
+      processes,
+      logs: {
+        stdout: logs.stdout,
+        stderr: logs.stderr,
+      },
+    });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
 // Mount admin API routes under /admin
 api.route('/admin', adminApi);
 
